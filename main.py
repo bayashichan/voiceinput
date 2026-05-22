@@ -41,7 +41,8 @@ class AppState:
 
 
 class AudioRecorder:
-    def __init__(self):
+    def __init__(self, device: int | None = None):
+        self._device = device
         self._chunks: collections.deque = collections.deque()
         self._stream: sd.InputStream | None = None
 
@@ -53,6 +54,7 @@ class AudioRecorder:
             dtype=DTYPE,
             callback=self._callback,
             blocksize=BLOCKSIZE,
+            device=self._device,
         )
         self._stream.start()
 
@@ -110,6 +112,27 @@ class PasteHandler:
         keyboard.send("ctrl+v")
 
 
+def _parse_mic_index(value: str) -> int | None:
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _print_microphones(selected: int | None) -> None:
+    devices = sd.query_devices()
+    print("[Voice Input] 利用可能なマイク一覧:")
+    for i, dev in enumerate(devices):
+        if dev["max_input_channels"] > 0:
+            marker = " <-- 使用中" if i == selected else (
+                " <-- 使用中 (システム既定)" if selected is None and dev["name"] == sd.query_devices(kind="input")["name"] else ""
+            )
+            print(f"  [{i}] {dev['name']}{marker}")
+    if selected is None:
+        print("  ※ MICROPHONE_INDEX 未指定のためシステム既定を使用")
+    print()
+
+
 def _make_icon(state_name: str) -> Image.Image:
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -127,9 +150,10 @@ class VoiceInputApp:
 
         self._hotkey = os.environ.get("HOTKEY", "ctrl+space")
         model = os.environ.get("WHISPER_MODEL", WHISPER_MODEL_DEFAULT)
+        mic_index = _parse_mic_index(os.environ.get("MICROPHONE_INDEX", ""))
 
         self._state = AppState()
-        self._recorder = AudioRecorder()
+        self._recorder = AudioRecorder(device=mic_index)
         self._transcriber = GroqTranscriber(api_key=api_key, model=model)
         self._paste_handler = PasteHandler()
         self._icon: pystray.Icon | None = None
@@ -204,8 +228,10 @@ class VoiceInputApp:
         icon.stop()
 
     def run(self) -> None:
+        _print_microphones(self._recorder._device)
+
         try:
-            sd.query_devices(kind="input")
+            sd.query_devices(self._recorder._device, kind="input")
         except sd.PortAudioError as e:
             sys.exit(f"ERROR: マイクが見つかりません: {e}")
 

@@ -120,6 +120,14 @@ class AudioRecorder:
         self._stream: sd.InputStream | None = None
 
     def start(self):
+        # Close any orphaned stream left over from an aborted recording
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
         self._chunks.clear()
         self._stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
@@ -410,30 +418,42 @@ class VoiceInputApp:
             self._icon.title = f"Voice Input [{state}]"
 
     def _on_hotkey(self) -> None:
+        # This callback runs inside the keyboard library's WH_KEYBOARD_LL hook.
+        # Windows removes the hook if it does not return within LowLevelHooksTimeout
+        # (~200 ms). We must not do any slow work here — only state updates and
+        # thread spawns so the callback returns in well under 1 ms.
         with self._state.lock:
             if self._state.is_processing:
                 return
             starting = not self._state.is_recording
             if starting:
-                # Capture target window NOW — user is guaranteed to be in it
                 self._hwnd = ctypes.windll.user32.GetForegroundWindow()
                 self._state.is_recording = True
             else:
                 self._state.is_recording = False
                 self._state.is_processing = True
 
-        # Heavy operations run outside the lock so the hook callback returns fast
         if starting:
-            try:
-                self._recorder.start()
-                self._set_icon_state("recording")
-            except Exception as e:
-                print(f"[Voice Input] Failed to start recording: {e}", file=sys.stderr)
-                with self._state.lock:
-                    self._state.is_recording = False
-                self._set_icon_state("error")
+            threading.Thread(target=self._start_recording, daemon=True).start()
         else:
             threading.Thread(target=self._stop_and_transcribe, args=(self._hwnd,), daemon=True).start()
+
+    def _start_recording(self) -> None:
+        try:
+            self._recorder.start()
+        except Exception as e:
+            print(f"[Voice Input] Failed to start recording: {e}", file=sys.stderr)
+            with self._state.lock:
+                self._state.is_recording = False
+            self._set_icon_state("error")
+            return
+        # Guard against an immediate second hotkey press that already set
+        # is_recording back to False before we could start the stream.
+        with self._state.lock:
+            if not self._state.is_recording:
+                self._recorder.stop()
+                return
+        self._set_icon_state("recording")
 
     def _stop_and_transcribe(self, hwnd: int = 0) -> None:
         # Entire body is guarded by try/finally so is_processing is ALWAYS

@@ -1,4 +1,5 @@
 import collections
+import ctypes
 import io
 import os
 import sys
@@ -99,10 +100,12 @@ class GroqTranscriber:
 
 
 class PasteHandler:
-    def paste_text(self, text: str) -> None:
+    def paste_text(self, text: str, hwnd: int = 0) -> None:
         if not text:
             return
         pyperclip.copy(text)
+        if hwnd:
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
         time.sleep(PASTE_DELAY)
         keyboard.send("ctrl+v")
 
@@ -143,9 +146,10 @@ class VoiceInputApp:
             if not self._state.is_recording:
                 self._start_recording()
             else:
+                hwnd = ctypes.windll.user32.GetForegroundWindow()
                 self._state.is_recording = False
                 self._state.is_processing = True
-                threading.Thread(target=self._stop_and_transcribe, daemon=True).start()
+                threading.Thread(target=self._stop_and_transcribe, args=(hwnd,), daemon=True).start()
 
     def _start_recording(self) -> None:
         self._state.is_recording = True
@@ -153,7 +157,7 @@ class VoiceInputApp:
         self._set_icon_state("recording")
         print("[Voice Input] 録音開始")
 
-    def _stop_and_transcribe(self) -> None:
+    def _stop_and_transcribe(self, hwnd: int = 0) -> None:
         duration = self._recorder.estimate_duration()
         wav_bytes = self._recorder.stop()
         self._set_icon_state("processing")
@@ -170,7 +174,7 @@ class VoiceInputApp:
             text = self._transcriber.transcribe(wav_bytes)
             print(f"[Voice Input] 認識結果: {text!r}")
             if text:
-                self._paste_handler.paste_text(text)
+                self._paste_handler.paste_text(text, hwnd)
             else:
                 print("[Voice Input] 認識結果が空です。貼り付けをスキップ。")
         except groq.APIError as e:

@@ -1,17 +1,16 @@
 @echo off
-chcp 65001 > nul
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
 echo.
 echo ==========================================
-echo   Voice Input - セットアップ
+echo   Voice Input - Setup
 echo ==========================================
 echo.
 
-:: ---- Python コマンドを自動検出 ----
-:: python → py の順に試す（PATH未設定でも py ランチャーが使えることが多い）
+:: ---- Detect Python ----
 set PYTHON=
+set PYTHONW=
 python --version > nul 2>&1
 if not errorlevel 1 (
     set PYTHON=python
@@ -22,17 +21,10 @@ if not errorlevel 1 (
     set PYTHON=py
     goto :check_version
 )
-
-:: どちらも見つからない場合
-echo [エラー] Python が見つかりませんでした。
+echo [ERROR] Python not found.
 echo.
-echo 【対処法】
-echo   1. https://www.python.org/downloads/ を開く
-echo   2. 「Download Python 3.x.x」をクリック
-echo   3. インストーラーを起動する
-echo   4. 最初の画面の「Add python.exe to PATH」に必ずチェックを入れる  ★重要
-echo   5. 「Install Now」をクリック
-echo   6. 完了後、このファイル（setup.bat）を再度ダブルクリックする
+echo Install from: https://www.python.org/downloads/
+echo IMPORTANT: Check "Add python.exe to PATH" during install.
 echo.
 pause
 exit /b 1
@@ -40,87 +32,102 @@ exit /b 1
 :check_version
 %PYTHON% -c "import sys;exit(0 if sys.version_info>=(3,10) else 1)" > nul 2>&1
 if errorlevel 1 (
-    echo [エラー] Python 3.10 以上が必要です。
+    echo [ERROR] Python 3.10+ required.
     %PYTHON% --version
-    echo   上記のバージョンでは動作しません。
-    echo   https://www.python.org/downloads/ から最新版をインストールしてください。
-    echo.
     pause
     exit /b 1
 )
-for /f "delims=" %%v in ('%PYTHON% --version') do echo [OK] %%v を確認しました
+for /f "delims=" %%v in ('%PYTHON% --version') do echo [OK] %%v found
+
+:: Locate pythonw (console-less launcher)
+for /f "delims=" %%p in ('where %PYTHON%w 2^>nul') do set PYTHONW=%%p
+if "!PYTHONW!"=="" for /f "delims=" %%p in ('where %PYTHON% 2^>nul') do set PYTHONW=%%p
 echo.
 
-:: ---- ライブラリ インストール ----
-echo [1/3] 必要なライブラリをインストールしています...
-echo       初回は数分かかる場合があります。しばらくお待ちください。
+:: ---- Install libraries ----
+echo [1/4] Installing libraries (first run may take a few minutes)...
 echo.
 %PYTHON% -m pip install -r requirements.txt
 if errorlevel 1 (
     echo.
-    echo [エラー] インストールに失敗しました。
-    echo 上のエラーメッセージを確認してください。
+    echo [ERROR] Installation failed. See message above.
     pause
     exit /b 1
 )
 echo.
-echo [OK] ライブラリのインストール完了
+echo [OK] Libraries installed
 echo.
 
-:: ---- .env ファイル作成 ----
-echo [2/3] 設定ファイルを確認中...
+:: ---- Create .env ----
+echo [2/4] Checking config file...
 if not exist ".env" (
     copy ".env.example" ".env" > nul
-    echo [OK] .env ファイルを作成しました
+    echo [OK] Created .env
 ) else (
-    echo [OK] .env ファイルが存在します
+    echo [OK] .env already exists
 )
 echo.
 
-:: ---- API キー確認・設定 ----
-echo [3/3] Groq API キーを確認中...
+:: ---- API key ----
+echo [3/4] Checking Groq API key...
 findstr /C:"GROQ_API_KEY=gsk_" ".env" > nul 2>&1
 if errorlevel 1 (
-    echo API キーが未設定です。
+    echo API key not set.
     echo.
-    echo Groq コンソール（console.groq.com）で取得した
-    echo API キー（gsk_ で始まる文字列）を貼り付けて Enter を押してください:
+    echo Paste your Groq API key (starts with gsk_) then press Enter:
     echo.
-    %PYTHON% -c "import re;from pathlib import Path;key=input('  APIキー > ').strip();e=Path('.env').read_text('utf-8');e=re.sub('GROQ_API_KEY=.*','GROQ_API_KEY='+key,e);Path('.env').write_text(e,'utf-8');print();print('[OK] API キーを保存しました')"
+    %PYTHON% -c "import re;from pathlib import Path;key=input('  API key > ').strip();e=Path('.env').read_text('utf-8');e=re.sub('GROQ_API_KEY=.*','GROQ_API_KEY='+key,e);Path('.env').write_text(e,'utf-8');print('[OK] API key saved')"
     if errorlevel 1 (
-        echo [エラー] API キーの保存に失敗しました。
+        echo [ERROR] Failed to save API key.
         pause
         exit /b 1
     )
 ) else (
-    echo [OK] API キーは設定済みです
+    echo [OK] API key already set
 )
 echo.
 
-:: ---- 起動コマンドを決定（pythonw = コンソールなし起動）----
-set PYTHONW=pythonw
-pythonw --version > nul 2>&1
-if errorlevel 1 (
-    set PYTHONW=%PYTHON%w
-    %PYTHON%w --version > nul 2>&1
-    if errorlevel 1 set PYTHONW=%PYTHON%
-)
+:: ---- Startup registration ----
+echo [4/4] Windows startup registration...
+set "STARTUP_DIR=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
+set "LNK_PATH=!STARTUP_DIR!\VoiceInput.lnk"
+set "APP_DIR=%CD%"
 
-:: ---- 完了 ----
+if exist "!LNK_PATH!" (
+    echo [OK] Already registered for startup
+) else (
+    choice /C YN /M "Register Voice Input to launch automatically with Windows?"
+    if not errorlevel 2 (
+        powershell -Command "$wsh=New-Object -ComObject WScript.Shell;$lnk=$wsh.CreateShortcut('!LNK_PATH!');$lnk.TargetPath='!PYTHONW!';$lnk.Arguments='\"!APP_DIR!\main.py\"';$lnk.WorkingDirectory='!APP_DIR!';$lnk.WindowStyle=7;$lnk.Save()" > nul 2>&1
+        if exist "!LNK_PATH!" (
+            echo [OK] Registered for startup
+        ) else (
+            echo [WARN] Could not create shortcut. Manually copy start.bat to:
+            echo        !STARTUP_DIR!
+        )
+    ) else (
+        echo Skipped.
+    )
+)
+echo.
+
+:: ---- Done ----
 echo ==========================================
-echo   セットアップ完了！
+echo   Setup complete!
 echo ==========================================
 echo.
-echo ショートカットキー : Ctrl+Space で録音開始 / 停止
-echo 終了方法           : タスクトレイのアイコンを右クリック → 終了
+echo Hotkey : Ctrl+Space to start/stop recording
+echo Quit   : Right-click the tray icon, then Quit
+echo Mic    : Run list_mics.bat to see device numbers
+echo         Then set MICROPHONE_INDEX=^<number^> in .env
 echo.
-choice /C YN /M "今すぐ起動しますか？"
+choice /C YN /M "Launch Voice Input now?"
 if errorlevel 2 goto :done
 echo.
-echo 起動しています... タスクトレイ（画面右下）を確認してください。
-start %PYTHONW% main.py
+echo Launching... Check the system tray (bottom-right).
+start "VoiceInput" "!PYTHONW!" "!APP_DIR!\main.py"
 echo.
 :done
-echo 次回からは start.bat をダブルクリックで起動できます。
+echo Use start.bat to launch next time.
 echo.
 pause

@@ -413,32 +413,40 @@ class VoiceInputApp:
         with self._state.lock:
             if self._state.is_processing:
                 return
-            if not self._state.is_recording:
+            starting = not self._state.is_recording
+            if starting:
                 # Capture target window NOW — user is guaranteed to be in it
                 self._hwnd = ctypes.windll.user32.GetForegroundWindow()
                 self._state.is_recording = True
-                self._recorder.start()
-                self._set_icon_state("recording")
             else:
                 self._state.is_recording = False
                 self._state.is_processing = True
-                threading.Thread(target=self._stop_and_transcribe, args=(self._hwnd,), daemon=True).start()
+
+        # Heavy operations run outside the lock so the hook callback returns fast
+        if starting:
+            try:
+                self._recorder.start()
+                self._set_icon_state("recording")
+            except Exception as e:
+                print(f"[Voice Input] Failed to start recording: {e}", file=sys.stderr)
+                with self._state.lock:
+                    self._state.is_recording = False
+                self._set_icon_state("error")
+        else:
+            threading.Thread(target=self._stop_and_transcribe, args=(self._hwnd,), daemon=True).start()
 
     def _stop_and_transcribe(self, hwnd: int = 0) -> None:
-        duration = self._recorder.estimate_duration()
-        wav_bytes = self._recorder.stop()
-        self._set_icon_state("processing")
-
-        if duration < MIN_RECORDING_SECONDS:
-            with self._state.lock:
-                self._state.is_processing = False
-            self._set_icon_state("idle")
-            return
-
+        # Entire body is guarded by try/finally so is_processing is ALWAYS
+        # reset to False, even if recorder.stop() or the API call throws.
         try:
-            text = self._transcriber.transcribe(wav_bytes)
-            if text:
-                self._paste.paste_text(text, hwnd)
+            duration = self._recorder.estimate_duration()
+            wav_bytes = self._recorder.stop()
+            self._set_icon_state("processing")
+
+            if duration >= MIN_RECORDING_SECONDS:
+                text = self._transcriber.transcribe(wav_bytes)
+                if text:
+                    self._paste.paste_text(text, hwnd)
         except groq.APIError as e:
             print(f"[Voice Input] API error: {e}", file=sys.stderr)
             self._set_icon_state("error")

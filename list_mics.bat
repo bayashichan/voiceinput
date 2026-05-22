@@ -14,12 +14,4 @@ if "%PYTHON%"=="" (
     exit /b 1
 )
 
-echo.
-echo Available microphones:
-echo.
-%PYTHON% -c "import sounddevice as sd; devs=sd.query_devices(); default=sd.query_devices(kind='input')['name']; [print('  [' + str(i) + '] ' + d['name'] + (' <-- default' if d['name']==default else '')) for i,d in enumerate(devs) if d['max_input_channels']>0]; print()"
-echo.
-echo To use a specific mic: open .env and uncomment/set MICROPHONE_INDEX=^<number^>
-echo Example: MICROPHONE_INDEX=1
-echo.
-pause
+%PYTHON% list_mics.py

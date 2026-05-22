@@ -2,10 +2,13 @@ import collections
 import ctypes
 import io
 import os
+import queue
+import re
 import sys
 import threading
 import time
 import wave
+from pathlib import Path
 
 import groq
 import keyboard
@@ -15,6 +18,19 @@ import pystray
 import sounddevice as sd
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw
+
+try:
+    import tkinter as tk
+    from tkinter import messagebox
+    _HAS_TK = True
+except ImportError:
+    _HAS_TK = False
+
+try:
+    import winreg
+    _HAS_WINREG = True
+except ImportError:
+    _HAS_WINREG = False
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
@@ -32,6 +48,63 @@ TRAY_COLORS = {
     "error":      "#FF6600",
 }
 
+ENV_PATH = Path(__file__).parent / ".env"
+STARTUP_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_REG_NAME = "VoiceInput"
+
+
+# ---- .env helpers ----
+
+def _update_env(key: str, value: str) -> None:
+    content = ENV_PATH.read_text("utf-8") if ENV_PATH.exists() else ""
+    pattern = rf"^{re.escape(key)}=.*"
+    if re.search(pattern, content, re.MULTILINE):
+        content = re.sub(pattern, f"{key}={value}", content, flags=re.MULTILINE)
+    else:
+        content = content.rstrip("\n") + f"\n{key}={value}\n"
+    ENV_PATH.write_text(content, "utf-8")
+
+
+# ---- Startup (Windows registry) helpers ----
+
+def _startup_cmd() -> str:
+    pythonw = Path(sys.executable).parent / "pythonw.exe"
+    exe = str(pythonw) if pythonw.exists() else sys.executable
+    return f'"{exe}" "{Path(__file__).resolve()}"'
+
+
+def _is_startup_registered() -> bool:
+    if not _HAS_WINREG:
+        return False
+    try:
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_KEY, 0, winreg.KEY_READ)
+        winreg.QueryValueEx(k, STARTUP_REG_NAME)
+        winreg.CloseKey(k)
+        return True
+    except OSError:
+        return False
+
+
+def _register_startup() -> None:
+    if not _HAS_WINREG:
+        return
+    k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_KEY, 0, winreg.KEY_SET_VALUE)
+    winreg.SetValueEx(k, STARTUP_REG_NAME, 0, winreg.REG_SZ, _startup_cmd())
+    winreg.CloseKey(k)
+
+
+def _unregister_startup() -> None:
+    if not _HAS_WINREG:
+        return
+    try:
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_KEY, 0, winreg.KEY_SET_VALUE)
+        winreg.DeleteValue(k, STARTUP_REG_NAME)
+        winreg.CloseKey(k)
+    except OSError:
+        pass
+
+
+# ---- Core classes ----
 
 class AppState:
     def __init__(self):
@@ -69,10 +142,7 @@ class AudioRecorder:
             self._stream.close()
             self._stream = None
         chunks = list(self._chunks)
-        if chunks:
-            audio_data = np.concatenate(chunks, axis=0)
-        else:
-            audio_data = np.zeros((0, CHANNELS), dtype=np.int16)
+        audio_data = np.concatenate(chunks, axis=0) if chunks else np.zeros((0, CHANNELS), dtype=np.int16)
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(CHANNELS)
@@ -112,83 +182,231 @@ class PasteHandler:
         keyboard.send("ctrl+v")
 
 
-def _parse_mic_index(value: str) -> int | None:
-    try:
-        return int(value)
-    except (ValueError, TypeError):
-        return None
+# ---- Settings GUI (tkinter in background thread) ----
+
+def _center(win: "tk.Toplevel") -> None:
+    win.update_idletasks()
+    w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
 
 
-def _print_microphones(selected: int | None) -> None:
-    devices = sd.query_devices()
-    print("[Voice Input] 利用可能なマイク一覧:")
-    for i, dev in enumerate(devices):
-        if dev["max_input_channels"] > 0:
-            marker = " <-- 使用中" if i == selected else (
-                " <-- 使用中 (システム既定)" if selected is None and dev["name"] == sd.query_devices(kind="input")["name"] else ""
-            )
-            print(f"  [{i}] {dev['name']}{marker}")
-    if selected is None:
-        print("  ※ MICROPHONE_INDEX 未指定のためシステム既定を使用")
-    print()
+class SettingsManager:
+    def __init__(self, app: "VoiceInputApp"):
+        self._app = app
+        self._q: queue.Queue = queue.Queue()
+        self._root: "tk.Tk | None" = None
+        if _HAS_TK:
+            threading.Thread(target=self._run_tk, daemon=True).start()
 
+    def _run_tk(self) -> None:
+        self._root = tk.Tk()
+        self._root.withdraw()
+        self._root.after(100, self._poll)
+        self._root.mainloop()
+
+    def _poll(self) -> None:
+        try:
+            while True:
+                self._q.get_nowait()()
+        except queue.Empty:
+            pass
+        if self._root:
+            self._root.after(100, self._poll)
+
+    def _schedule(self, func) -> None:
+        if _HAS_TK:
+            self._q.put(func)
+
+    # ---- tray menu entry points ----
+
+    def show_mic_dialog(self, icon=None, item=None):
+        self._schedule(self._do_mic)
+
+    def show_hotkey_dialog(self, icon=None, item=None):
+        self._schedule(self._do_hotkey)
+
+    def show_startup_dialog(self, icon=None, item=None):
+        self._schedule(self._do_startup)
+
+    # ---- dialogs ----
+
+    def _make_win(self, title: str) -> "tk.Toplevel":
+        win = tk.Toplevel(self._root)
+        win.title(title)
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        win.grab_set()
+        win.focus_force()
+        return win
+
+    def _do_mic(self) -> None:
+        try:
+            devs = sd.query_devices()
+            inputs = [(i, d["name"]) for i, d in enumerate(devs) if d["max_input_channels"] > 0]
+        except Exception as e:
+            messagebox.showerror("Error", f"Cannot read audio devices:\n{e}")
+            return
+
+        win = self._make_win("Microphone Settings")
+        tk.Label(win, text="Select microphone:", anchor="w", padx=16, pady=10).pack(fill="x")
+
+        var = tk.IntVar(value=-1 if self._app._recorder._device is None else self._app._recorder._device)
+
+        f = tk.Frame(win, padx=24)
+        f.pack(fill="x", pady=(0, 8))
+        tk.Radiobutton(f, text="System default", variable=var, value=-1).pack(anchor="w")
+        for idx, name in inputs:
+            tk.Radiobutton(f, text=f"[{idx}]  {name}", variable=var, value=idx).pack(anchor="w")
+
+        bf = tk.Frame(win)
+        bf.pack(pady=(4, 12))
+
+        def ok():
+            v = var.get()
+            self._app._apply_mic(None if v == -1 else v)
+            win.destroy()
+
+        tk.Button(bf, text="OK", width=9, command=ok).pack(side="left", padx=4)
+        tk.Button(bf, text="Cancel", width=9, command=win.destroy).pack(side="left", padx=4)
+        _center(win)
+        win.wait_window()
+
+    def _do_hotkey(self) -> None:
+        win = self._make_win("Hotkey Settings")
+        tk.Label(win, text="New hotkey:", anchor="w", padx=16, pady=10).pack(fill="x")
+
+        entry = tk.Entry(win, width=26)
+        entry.insert(0, self._app._hotkey)
+        entry.pack(padx=16, pady=(0, 4))
+        tk.Label(win, text="e.g.  ctrl+space  /  ctrl+shift+f2", fg="gray", padx=16).pack(anchor="w")
+
+        bf = tk.Frame(win)
+        bf.pack(pady=(8, 12))
+
+        def ok():
+            h = entry.get().strip().lower()
+            if not h:
+                return
+            try:
+                self._app._apply_hotkey(h)
+                win.destroy()
+            except Exception as e:
+                messagebox.showerror("Error", str(e), parent=win)
+
+        entry.bind("<Return>", lambda _: ok())
+        tk.Button(bf, text="OK", width=9, command=ok).pack(side="left", padx=4)
+        tk.Button(bf, text="Cancel", width=9, command=win.destroy).pack(side="left", padx=4)
+        _center(win)
+        entry.focus_set()
+        entry.select_range(0, "end")
+        win.wait_window()
+
+    def _do_startup(self) -> None:
+        win = self._make_win("Startup Settings")
+        var = tk.BooleanVar(value=_is_startup_registered())
+
+        tk.Checkbutton(
+            win,
+            text="Launch Voice Input when Windows starts",
+            variable=var,
+            padx=16, pady=14,
+        ).pack(anchor="w")
+
+        bf = tk.Frame(win)
+        bf.pack(pady=(0, 12))
+
+        def ok():
+            _register_startup() if var.get() else _unregister_startup()
+            win.destroy()
+
+        tk.Button(bf, text="OK", width=9, command=ok).pack(side="left", padx=4)
+        tk.Button(bf, text="Cancel", width=9, command=win.destroy).pack(side="left", padx=4)
+        _center(win)
+        win.wait_window()
+
+
+# ---- Tray icon ----
 
 def _make_icon(state_name: str) -> Image.Image:
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    color = TRAY_COLORS.get(state_name, TRAY_COLORS["idle"])
-    draw.ellipse([4, 4, 60, 60], fill=color)
+    draw.ellipse([4, 4, 60, 60], fill=TRAY_COLORS.get(state_name, TRAY_COLORS["idle"]))
     return img
 
+
+# ---- Application ----
 
 class VoiceInputApp:
     def __init__(self):
         load_dotenv()
         api_key = os.environ.get("GROQ_API_KEY")
         if not api_key:
-            sys.exit("ERROR: GROQ_API_KEY が設定されていません。.env.example を .env にコピーして API キーを設定してください。")
+            sys.exit("ERROR: GROQ_API_KEY not set. Copy .env.example to .env and add your key.")
 
         self._hotkey = os.environ.get("HOTKEY", "ctrl+space")
         model = os.environ.get("WHISPER_MODEL", WHISPER_MODEL_DEFAULT)
-        mic_index = _parse_mic_index(os.environ.get("MICROPHONE_INDEX", ""))
+
+        mic_raw = os.environ.get("MICROPHONE_INDEX", "").strip()
+        mic_index: int | None = None
+        try:
+            v = int(mic_raw)
+            if v >= 0:
+                mic_index = v
+        except (ValueError, TypeError):
+            pass
 
         self._state = AppState()
         self._recorder = AudioRecorder(device=mic_index)
         self._transcriber = GroqTranscriber(api_key=api_key, model=model)
-        self._paste_handler = PasteHandler()
+        self._paste = PasteHandler()
+        self._settings = SettingsManager(self)
         self._icon: pystray.Icon | None = None
+        self._hotkey_handler = None
 
-    def _set_icon_state(self, state_name: str) -> None:
+    # ---- live settings application ----
+
+    def _apply_mic(self, device: int | None) -> None:
+        self._recorder._device = device
+        _update_env("MICROPHONE_INDEX", "" if device is None else str(device))
+
+    def _apply_hotkey(self, new_hotkey: str) -> None:
+        if self._hotkey_handler is not None:
+            keyboard.remove_hotkey(self._hotkey_handler)
+        self._hotkey_handler = keyboard.add_hotkey(new_hotkey, self._on_hotkey, suppress=True)
+        self._hotkey = new_hotkey
+        _update_env("HOTKEY", new_hotkey)
         if self._icon:
-            self._icon.icon = _make_icon(state_name)
-            self._icon.title = f"Voice Input [{state_name}]"
+            self._icon.menu = self._build_menu()
+            self._icon.update_menu()
+
+    # ---- recording / transcription ----
+
+    def _set_icon_state(self, state: str) -> None:
+        if self._icon:
+            self._icon.icon = _make_icon(state)
+            self._icon.title = f"Voice Input [{state}]"
 
     def _on_hotkey(self) -> None:
         with self._state.lock:
             if self._state.is_processing:
                 return
             if not self._state.is_recording:
-                self._start_recording()
+                self._state.is_recording = True
+                self._recorder.start()
+                self._set_icon_state("recording")
             else:
                 hwnd = ctypes.windll.user32.GetForegroundWindow()
                 self._state.is_recording = False
                 self._state.is_processing = True
                 threading.Thread(target=self._stop_and_transcribe, args=(hwnd,), daemon=True).start()
 
-    def _start_recording(self) -> None:
-        self._state.is_recording = True
-        self._recorder.start()
-        self._set_icon_state("recording")
-        print("[Voice Input] 録音開始")
-
     def _stop_and_transcribe(self, hwnd: int = 0) -> None:
         duration = self._recorder.estimate_duration()
         wav_bytes = self._recorder.stop()
         self._set_icon_state("processing")
-        print(f"[Voice Input] 録音停止 ({duration:.1f}秒)")
 
         if duration < MIN_RECORDING_SECONDS:
-            print("[Voice Input] 録音が短すぎます。スキップ。")
             with self._state.lock:
                 self._state.is_processing = False
             self._set_icon_state("idle")
@@ -196,17 +414,14 @@ class VoiceInputApp:
 
         try:
             text = self._transcriber.transcribe(wav_bytes)
-            print(f"[Voice Input] 認識結果: {text!r}")
             if text:
-                self._paste_handler.paste_text(text, hwnd)
-            else:
-                print("[Voice Input] 認識結果が空です。貼り付けをスキップ。")
+                self._paste.paste_text(text, hwnd)
         except groq.APIError as e:
-            print(f"[Voice Input] Groq API エラー: {e}", file=sys.stderr)
+            print(f"[Voice Input] API error: {e}", file=sys.stderr)
             self._set_icon_state("error")
             time.sleep(2.0)
         except Exception as e:
-            print(f"[Voice Input] 予期しないエラー: {e}", file=sys.stderr)
+            print(f"[Voice Input] Error: {e}", file=sys.stderr)
             self._set_icon_state("error")
             time.sleep(2.0)
         finally:
@@ -214,31 +429,38 @@ class VoiceInputApp:
                 self._state.is_processing = False
             self._set_icon_state("idle")
 
+    # ---- tray menu ----
+
     def _build_menu(self) -> pystray.Menu:
+        hotkey = self._hotkey
         return pystray.Menu(
             pystray.MenuItem("Voice Input", action=None, enabled=False),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem(f"ホットキー: {self._hotkey}", action=None, enabled=False),
+            pystray.MenuItem(f"Hotkey: {hotkey}", action=None, enabled=False),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("終了", self._on_quit),
+            pystray.MenuItem("Microphone...",  self._settings.show_mic_dialog),
+            pystray.MenuItem("Hotkey...",      self._settings.show_hotkey_dialog),
+            pystray.MenuItem("Startup...",     self._settings.show_startup_dialog),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit", self._on_quit),
         )
 
     def _on_quit(self, icon: pystray.Icon, item) -> None:
         keyboard.unhook_all()
         icon.stop()
 
-    def run(self) -> None:
-        _print_microphones(self._recorder._device)
+    # ---- entry point ----
 
+    def run(self) -> None:
         try:
             sd.query_devices(self._recorder._device, kind="input")
         except sd.PortAudioError as e:
-            sys.exit(f"ERROR: マイクが見つかりません: {e}")
+            sys.exit(f"ERROR: Microphone not found: {e}")
 
         try:
-            keyboard.add_hotkey(self._hotkey, self._on_hotkey, suppress=True)
+            self._hotkey_handler = keyboard.add_hotkey(self._hotkey, self._on_hotkey, suppress=True)
         except Exception as e:
-            sys.exit(f"ERROR: ホットキーの登録に失敗しました ({self._hotkey}): {e}\n管理者として実行してみてください。")
+            sys.exit(f"ERROR: Failed to register hotkey ({self._hotkey}): {e}")
 
         self._icon = pystray.Icon(
             name="voiceinput",
@@ -246,12 +468,8 @@ class VoiceInputApp:
             title="Voice Input [idle]",
             menu=self._build_menu(),
         )
-
-        print(f"[Voice Input] 起動完了。ホットキー: {self._hotkey}")
-        print("[Voice Input] タスクトレイのアイコンを右クリックして終了できます。")
         self._icon.run()
 
 
 if __name__ == "__main__":
-    app = VoiceInputApp()
-    app.run()
+    VoiceInputApp().run()

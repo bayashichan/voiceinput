@@ -122,7 +122,7 @@ class VoiceInputApp:
         if not api_key:
             sys.exit("ERROR: GROQ_API_KEY が設定されていません。.env.example を .env にコピーして API キーを設定してください。")
 
-        self._hotkey = os.environ.get("HOTKEY", "ctrl+shift+space")
+        self._hotkey = os.environ.get("HOTKEY", "ctrl+space")
         model = os.environ.get("WHISPER_MODEL", WHISPER_MODEL_DEFAULT)
 
         self._state = AppState()

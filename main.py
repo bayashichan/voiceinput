@@ -38,7 +38,7 @@ DTYPE = "int16"
 WHISPER_MODEL_DEFAULT = "whisper-large-v3-turbo"
 WHISPER_PROMPT = "こんにちは。今日は、とても良い天気ですね。これから、音声入力を開始します。"
 MIN_RECORDING_SECONDS = 0.5
-PASTE_DELAY = 0.15
+PASTE_DELAY = 0.3
 BLOCKSIZE = 4096
 
 TRAY_COLORS = {
@@ -171,13 +171,34 @@ class GroqTranscriber:
         return response.strip() if isinstance(response, str) else response.text.strip()
 
 
+def _set_foreground(hwnd: int) -> None:
+    """Bring hwnd to foreground reliably using AttachThreadInput workaround.
+
+    Plain SetForegroundWindow() is silently ignored on Windows 10/11 when called
+    from a background thread that doesn't currently own the foreground lock.
+    Attaching to the foreground thread's input queue first grants that right.
+    """
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    fg_hwnd = user32.GetForegroundWindow()
+    fg_tid = user32.GetWindowThreadProcessId(fg_hwnd, None)
+    cur_tid = kernel32.GetCurrentThreadId()
+    attached = fg_tid and fg_tid != cur_tid
+    if attached:
+        user32.AttachThreadInput(fg_tid, cur_tid, True)
+    user32.BringWindowToTop(hwnd)
+    user32.SetForegroundWindow(hwnd)
+    if attached:
+        user32.AttachThreadInput(fg_tid, cur_tid, False)
+
+
 class PasteHandler:
     def paste_text(self, text: str, hwnd: int = 0) -> None:
         if not text:
             return
         pyperclip.copy(text)
         if hwnd:
-            ctypes.windll.user32.SetForegroundWindow(hwnd)
+            _set_foreground(hwnd)
         time.sleep(PASTE_DELAY)
         keyboard.send("ctrl+v")
 
@@ -363,6 +384,7 @@ class VoiceInputApp:
         self._settings = SettingsManager(self)
         self._icon: pystray.Icon | None = None
         self._hotkey_handler = None
+        self._hwnd: int = 0
 
     # ---- live settings application ----
 
@@ -392,14 +414,15 @@ class VoiceInputApp:
             if self._state.is_processing:
                 return
             if not self._state.is_recording:
+                # Capture target window NOW — user is guaranteed to be in it
+                self._hwnd = ctypes.windll.user32.GetForegroundWindow()
                 self._state.is_recording = True
                 self._recorder.start()
                 self._set_icon_state("recording")
             else:
-                hwnd = ctypes.windll.user32.GetForegroundWindow()
                 self._state.is_recording = False
                 self._state.is_processing = True
-                threading.Thread(target=self._stop_and_transcribe, args=(hwnd,), daemon=True).start()
+                threading.Thread(target=self._stop_and_transcribe, args=(self._hwnd,), daemon=True).start()
 
     def _stop_and_transcribe(self, hwnd: int = 0) -> None:
         duration = self._recorder.estimate_duration()

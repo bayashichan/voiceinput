@@ -32,13 +32,21 @@ try:
 except ImportError:
     _HAS_WINREG = False
 
+_AUDIO_LOCK = threading.Lock()
+
+
 def _refresh_audio() -> None:
-    """Terminate and reinitialize PortAudio so newly connected devices are visible."""
-    try:
-        sd._terminate()
-        sd._initialize()
-    except Exception as e:
-        _log(f"PortAudio refresh error: {e}")
+    """Terminate and reinitialize PortAudio so newly connected devices are visible.
+
+    Uses a lock so concurrent calls from the device-monitor thread and the
+    tkinter thread cannot interleave sd._terminate() / sd._initialize() calls.
+    """
+    with _AUDIO_LOCK:
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception as e:
+            _log(f"PortAudio refresh error: {e}")
 
 
 SAMPLE_RATE = 16000
@@ -505,8 +513,13 @@ class SettingsManager:
     def _poll(self) -> None:
         try:
             while True:
-                self._q.get_nowait()()
-        except queue.Empty:
+                try:
+                    self._q.get_nowait()()
+                except queue.Empty:
+                    break
+                except Exception as e:
+                    _log(f"SettingsManager callback error: {type(e).__name__}: {e}")
+        except Exception:
             pass
         if self._root:
             self._root.after(100, self._poll)
@@ -555,8 +568,8 @@ class SettingsManager:
 
     def _do_mic(self) -> None:
         try:
-            _refresh_audio()
-            devs = sd.query_devices()
+            with _AUDIO_LOCK:
+                devs = sd.query_devices()
             inputs = [(i, d["name"]) for i, d in enumerate(devs) if d["max_input_channels"] > 0]
         except Exception as e:
             messagebox.showerror("Error", f"Cannot read audio devices:\n{e}")

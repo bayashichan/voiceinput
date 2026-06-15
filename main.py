@@ -570,7 +570,14 @@ class SettingsManager:
         try:
             with _AUDIO_LOCK:
                 devs = sd.query_devices()
-            inputs = [(i, d["name"]) for i, d in enumerate(devs) if d["max_input_channels"] > 0]
+                hostapis = sd.query_hostapis()
+            # WASAPI shows each physical device exactly once; fall back to all APIs if unavailable
+            wasapi_idx = next((i for i, h in enumerate(hostapis) if "WASAPI" in h["name"]), None)
+            if wasapi_idx is not None:
+                inputs = [(i, d["name"]) for i, d in enumerate(devs)
+                          if d["max_input_channels"] > 0 and d["hostapi"] == wasapi_idx]
+            else:
+                inputs = [(i, d["name"]) for i, d in enumerate(devs) if d["max_input_channels"] > 0]
         except Exception as e:
             messagebox.showerror("Error", f"Cannot read audio devices:\n{e}")
             return
@@ -818,10 +825,20 @@ class VoiceInputApp:
     def _device_monitor(self) -> None:
         """Poll for newly connected microphones every 5 s and notify the user."""
         INTERVAL = 5
+
+        def _wasapi_input_names() -> set[str]:
+            devs = sd.query_devices()
+            hostapis = sd.query_hostapis()
+            wasapi_idx = next((i for i, h in enumerate(hostapis) if "WASAPI" in h["name"]), None)
+            if wasapi_idx is not None:
+                return {d["name"] for d in devs
+                        if d["max_input_channels"] > 0 and d["hostapi"] == wasapi_idx}
+            return {d["name"] for d in devs if d["max_input_channels"] > 0}
+
         known: set[str] = set()
         _refresh_audio()
         try:
-            known = {d["name"] for d in sd.query_devices() if d["max_input_channels"] > 0}
+            known = _wasapi_input_names()
         except Exception:
             pass
 
@@ -833,7 +850,7 @@ class VoiceInputApp:
                     continue
             try:
                 _refresh_audio()
-                current = {d["name"] for d in sd.query_devices() if d["max_input_channels"] > 0}
+                current = _wasapi_input_names()
             except Exception as e:
                 _log(f"Device monitor: query_devices error: {e}")
                 continue

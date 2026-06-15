@@ -32,6 +32,15 @@ try:
 except ImportError:
     _HAS_WINREG = False
 
+def _refresh_audio() -> None:
+    """Terminate and reinitialize PortAudio so newly connected devices are visible."""
+    try:
+        sd._terminate()
+        sd._initialize()
+    except Exception as e:
+        _log(f"PortAudio refresh error: {e}")
+
+
 SAMPLE_RATE = 16000
 CHANNELS = 1
 DTYPE = "int16"
@@ -508,6 +517,22 @@ class SettingsManager:
 
     # ---- tray menu entry points ----
 
+    def show_new_mic_toast(self, names: str) -> None:
+        self._schedule(lambda: self._do_new_mic_toast(names))
+
+    def _do_new_mic_toast(self, names: str) -> None:
+        if not self._root:
+            return
+        win = tk.Toplevel(self._root)
+        win.title("Voice Input — 新しいマイク")
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        tk.Label(win, text="新しいマイクが接続されました", font=("", 10, "bold"), padx=16, pady=10).pack()
+        tk.Label(win, text=names, padx=16, pady=(0, 4)).pack()
+        tk.Label(win, text="トレイ → Microphone... で選択できます", fg="gray", padx=16, pady=(0, 10)).pack()
+        _center(win)
+        win.after(6000, win.destroy)
+
     def show_mic_dialog(self, icon=None, item=None):
         self._schedule(self._do_mic)
 
@@ -530,6 +555,7 @@ class SettingsManager:
 
     def _do_mic(self) -> None:
         try:
+            _refresh_audio()
             devs = sd.query_devices()
             inputs = [(i, d["name"]) for i, d in enumerate(devs) if d["max_input_channels"] > 0]
         except Exception as e:
@@ -780,17 +806,21 @@ class VoiceInputApp:
         """Poll for newly connected microphones every 5 s and notify the user."""
         INTERVAL = 5
         known: set[str] = set()
+        _refresh_audio()
         try:
-            devs = sd.query_devices()
-            known = {d["name"] for d in devs if d["max_input_channels"] > 0}
+            known = {d["name"] for d in sd.query_devices() if d["max_input_channels"] > 0}
         except Exception:
             pass
 
         while True:
             time.sleep(INTERVAL)
+            # Skip refresh while recording to avoid disrupting the active stream
+            with self._state.lock:
+                if self._state.is_recording:
+                    continue
             try:
-                devs = sd.query_devices()
-                current = {d["name"] for d in devs if d["max_input_channels"] > 0}
+                _refresh_audio()
+                current = {d["name"] for d in sd.query_devices() if d["max_input_channels"] > 0}
             except Exception as e:
                 _log(f"Device monitor: query_devices error: {e}")
                 continue
@@ -799,11 +829,7 @@ class VoiceInputApp:
             if added:
                 names = "\n".join(added)
                 _log(f"Device monitor: new mic detected: {', '.join(added)}")
-                if self._icon:
-                    self._icon.notify(
-                        f"新しいマイクが接続されました:\n{names}\n\nMicrophone... メニューから選択できます",
-                        "Voice Input",
-                    )
+                self._settings.show_new_mic_toast(names)
             if current != known:
                 known = current
 
